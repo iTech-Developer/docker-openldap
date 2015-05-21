@@ -1,0 +1,222 @@
+#!/bin/bash -e
+
+randpw(){ < /dev/urandom tr -dc [:alnum:][:punct:]  | head -c20; echo;}
+
+LDAP_DATA_DIR=/var/lib/ldap
+LDAP_LIB_DIR=/usr/lib/ldap
+
+DOMAIN=${DOMAIN:-example.com}
+ORG=${ORG:-example}
+BASE_DN=${BASE_DN:-dc=example,dc=com}
+ADMIN_DN=${ADMIN_DN:-cn=admin,dc=example,dc=com}
+ADMIN_PASS=${ADMIN_PASS:-`randpw`}
+ROOT_DN=${ROOT_DN:-cn=root,cn=config}
+ROOT_PASS=${ROOT_PASS:-`randpw`}
+
+FILE_LIMIT=${FILE_LIMIT:-1024}
+PURGE_DATABASE=${PURGE_DATABASE:-false}
+LDAP_V2=${LDAP_V2:-false}
+BACKEND=${BACKEND:-MDB}
+MOVE_OLD_DB=${MOVE_OLD_DB:-true}
+BACKUP_DIR=${BACKUP_DIR:-/var/backups}
+SSL_CIPHER=${EECDH+ECDSA+AESGCM EECDH+aRSA+AESGCM EECDH+ECDSA+SHA384 EECDH+ECDSA+SHA256 EECDH+aRSA+SHA384 EECDH+aRSA+SHA256 EECDH+aRSA+RC4 EECDH EDH+aRSA !aNULL !eNULL !LOW !3DES !MD5 !EXP !PSK !SRP !DSS !RC4}
+
+ENABLE_MEMBEROF=${ENABLE_MEMBEROF:-true}
+ENABLE_PPOLICY=${ENABLE_PPOLICY:-true}
+
+PWD_ATTRIBUTE=${PWD_ATTRIBUTE:-userPassword}
+PWD_MAX_AGE=${PWD_MAX_AGE:-0}
+PWD_EXPIRE_WARNING=${PWD_EXPIRE_WARNING:-0}
+PWD_IN_HISTORY=${PWD_IN_HISTORY:-0}
+PWD_CHECK_QUALITY=${PWD_CHECK_QUALITY:-1}
+PWD_MIN_LENGTH=${PWD_MIN_LENGTH:-8}
+PWD_MAX_FAILURE=${PWD_MAX_FAILURE:-7}
+PWD_LOCKOUT=${PWD_LOCKOUT:-TRUE}
+PWD_LOCKOUT_DURATION=${PWD_LOCKOUT_DURATION:-600}
+PWD_GRACE_AUTH_NLIMIT=${PWD_GRACE_AUTH_NLIMIT:-0}
+PWD_FAILURE_COUNT_INTERVAL=${PWD_FAILURE_COUNT_INTERVAL:-0}
+PWD_MUST_CHANGE=${PWD_MUST_CHANGE:-FALSE}
+PWD_ALLOW_USER_CHANGE=${PWD_ALLOW_USER_CHANGE:-TRUE}
+PWD_SAFE_MODIFY=${PWD_SAFE_MODIFY:-FALSE}
+
+if [ ! -f "$LDAP_DATA_DIR/.configured" ]; then
+   
+    echo "Admin DN: ${ADMIN_DN}, password: ${ADMIN_PASS}"
+    echo "Root DN: ${ROOT_DN}, password: ${ROOT_PASS}"
+
+	ulimit -n $FILE_LIMIT
+
+    if [ ! -e ${BACKUP_DIR} ]; then
+        mkdir -p ${BACKUP_DIR}
+    fi
+	cat <<- EOF | debconf-set-selections
+	slapd slapd/internal/generated_adminpw password ${ADMIN_PASS}
+	slapd slapd/internal/adminpw password ${ADMIN_PASS}
+	slapd slapd/password1 password ${ADMIN_PASS}
+	slapd slapd/password2 password ${ADMIN_PASS}
+	slapd slapd/password_mismatch note    
+	slapd slapd/domain string ${DOMAIN}
+	slapd shared/organization string ${ORG}
+	slapd slapd/backend select ${BACKEND}
+	slapd slapd/purge_database boolean ${PURGE_DATABASE}
+	slapd slapd/allow_ldap_v2 boolean ${LDAP_V2}
+	slapd slapd/move_old_database boolean ${MOVE_OLD_DB}
+	slapd slapd/unsafe_selfwrite_acl note
+	slapd slapd/invalid_config boolean true
+	slapd slapd/no_configuration boolean false
+	slapd slapd/upgrade_slapcat_failure error
+	slapd slapd/dump_database select when needed
+	slapd slapd/dump_database_destdir string ${LDAP_DATA_DIR}/slapd-VERSION
+	EOF
+
+	dpkg-reconfigure -f noninteractive slapd
+
+    if [ -f "${SSL_CRT_PATH}" -a -f "${SSL_KEY_PATH}" -a -f "${SSL_CA_PATH}" ]; then
+		echo <<- EOF >> /etc/ldap/slapd.conf
+		TLSCACertificateFile	${SSL_CA_PATH}
+		TLSCertificateKeyFile   ${SSL_KEY_PATH}
+		TLSCertificateFile	    ${SSL_CRT_PATH}
+        TLSCipherSuite          ${SSL_CIPHER}
+		EOF
+    else
+      echo "SSL keys and certificates were not found."     
+    fi
+
+	slapd -h "ldapi:///" -u openldap -g openldap
+
+	echo "Configure RootDN and RootPW"
+	ldapmodify \
+		-Y EXTERNAL \
+		-H ldapi:/// \
+		<<-EOF
+		dn: olcDatabase={0}config,cn=config
+		changetype: modify
+		delete: olcRootDN
+		
+		dn: olcDatabase={0}config,cn=config
+		changetype: modify
+		add: olcRootDN
+		olcRootDN: ${ROOT_DN}
+				
+		dn: olcDatabase={0}config,cn=config
+		changetype: modify
+		add: olcRootPW
+		olcRootPW: $(slappasswd -s ${ROOT_PASS})
+		EOF
+    
+    if [ "$ENABLE_MEMBEROF" = true ]; then
+    echo "Enable memberof overlay"    
+	ldapadd \
+		-Y EXTERNAL \
+		-H ldapi:/// \
+		<<-EOF
+		dn: cn=module,cn=config
+		cn: module
+		objectClass: olcModuleList
+		olcModuleLoad: memberof
+		olcModulePath: ${LDAP_LIB_DIR}
+
+		dn: olcOverlay={0}memberof,olcDatabase={1}${BACKEND},cn=config
+		objectClass: olcConfig
+		objectClass: olcMemberOf
+		objectClass: olcOverlayConfig
+		objectClass: top
+		olcOverlay: memberof
+		olcMemberOfDangling: ignore
+		olcMemberOfRefInt: TRUE
+		olcMemberOfGroupOC: groupOfNames
+		olcMemberOfMemberAD: member
+		olcMemberOfMemberOfAD: memberOf
+		EOF
+
+    echo "Enable refint overlay"         
+    ldapmodify \
+		-Y EXTERNAL \
+		-H ldapi:/// \
+		<<-EOF
+		dn: cn=module{1},cn=config
+		add: olcmoduleload
+		olcmoduleload: refint
+		EOF
+        
+	ldapadd \
+		-Y EXTERNAL \
+		-H ldapi:/// \
+		<<-EOF
+		dn: olcOverlay={1}refint,olcDatabase={1}${BACKEND},cn=config
+		objectClass: olcConfig
+		objectClass: olcOverlayConfig
+		objectClass: olcRefintConfig
+		objectClass: top
+		olcOverlay: {1}refint
+		olcRefintAttribute: memberof member manager owner
+		EOF
+	fi
+	
+    if [ "$ENABLE_PPOLICY" = true ]; then
+    echo "Add ppolicy schema" 
+	ldapadd \
+		-Y EXTERNAL \
+		-H ldapi:/// \
+		-f /etc/ldap/schema/ppolicy.ldif
+
+    echo "Enable ppolicy" 
+	ldapmodify \
+		-Y EXTERNAL \
+		-H ldapi:/// \
+		<<-EOF
+		dn: cn=module{1},cn=config
+		add: olcmoduleload
+		olcmoduleload: ppolicy
+		EOF
+		
+	ldapadd \
+		-Y EXTERNAL \
+		-H ldapi:/// \
+		<<-EOF	
+		dn: olcOverlay={2}ppolicy,olcDatabase={1}${BACKEND},cn=config
+		objectClass: olcOverlayConfig
+		objectClass: olcPPolicyConfig
+		olcOverlay: {2}ppolicy
+		olcPPolicyDefault: cn=passwordDefault,ou=policies,${BASE_DN}
+		olcPPolicyHashCleartext: FALSE
+		olcPPolicyUseLockout: FALSE
+		olcPPolicyForwardUpdates: FALSE
+		EOF
+
+	ldapadd \
+		-H ldapi:/// -x -D ${ADMIN_DN} -w ${ADMIN_PASS} \
+		<<-EOF	
+		dn: ou=policies,${BASE_DN}
+		objectClass: organizationalUnit
+		ou: policies
+		
+		dn: cn=passwordDefault,ou=policies,${BASE_DN}
+		cn: DefaultPPolicy
+		objectClass: pwdPolicy
+		objectClass: device
+		objectClass: top
+		pwdAttribute: ${PWD_ATTRIBUTE}
+		pwdMaxAge: ${PWD_MAX_AGE}
+		pwdExpireWarning: ${PWD_EXPIRE_WARNING}
+		pwdInHistory: ${PWD_IN_HISTORY}
+		pwdCheckQuality: ${PWD_CHECK_QUALITY}
+		pwdMinLength: ${PWD_MIN_LENGTH}
+		pwdMaxFailure: ${PWD_MAX_FAILURE}
+		pwdLockout: ${PWD_LOCKOUT}
+		pwdLockoutDuration: ${PWD_LOCKOUT_DURATION}
+		pwdGraceAuthNLimit: ${PWD_GRACE_AUTH_NLIMIT}
+		pwdFailureCountInterval: ${PWD_FAILURE_COUNT_INTERVAL}
+		pwdMustChange: ${PWD_MUST_CHANGE}
+		pwdAllowUserChange: ${PWD_ALLOW_USER_CHANGE}
+		pwdSafeModify: ${PWD_SAFE_MODIFY}
+		EOF
+	fi
+	killall slapd
+	
+	sleep 2
+
+	touch "$LDAP_DATA_DIR/.configured"
+    fi
+    
+/usr/sbin/slapd -h "ldap:/// ldaps:/// ldapi:///" -u openldap -g openldap -d 0
