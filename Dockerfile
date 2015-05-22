@@ -14,4 +14,4 @@ VOLUME /etc/ldap/slapd.d
 
 EXPOSE 389 636
 
-ENTRYPOINT ["/start"]
+CMD ["/start"]
