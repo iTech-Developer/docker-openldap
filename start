@@ -39,12 +39,13 @@ PWD_MUST_CHANGE=${PWD_MUST_CHANGE:-FALSE}
 PWD_ALLOW_USER_CHANGE=${PWD_ALLOW_USER_CHANGE:-TRUE}
 PWD_SAFE_MODIFY=${PWD_SAFE_MODIFY:-FALSE}
 
+ulimit -n $FILE_LIMIT
+
 if [ ! -f "$LDAP_DATA_DIR/.configured" ]; then
    
     echo "Admin DN: ${ADMIN_DN}, password: ${ADMIN_PASS}"
     echo "Root DN: ${ROOT_DN}, password: ${ROOT_PASS}"
 
-	ulimit -n $FILE_LIMIT
 
     if [ ! -e ${BACKUP_DIR} ]; then
         mkdir -p ${BACKUP_DIR}
